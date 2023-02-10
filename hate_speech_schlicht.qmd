@@ -1,0 +1,667 @@
+---
+title: "Detecting hate speech"
+author: "Schlicht Jana"
+date: "2023-02-10"
+execute: 
+  cache: true
+format:
+  html:
+    toc: true
+    number-sections: true
+    title-block-banner: true
+    code-overflow: scroll
+    code-block-bg: true
+    code-block-border-left: '#31BAE9'
+    scrollable: true
+    code-copy: true
+    theme: cosmo
+bibliography: references.bib
+editor: 
+  markdown: 
+    wrap: sentence
+---
+
+# Introduction
+
+On social media, anyone can create an account without having to verify their identity.
+This opportunity for anonymity is used by some users to spread hate speech without being recognised.
+But there are also users who do not even make use of the anonymity and spread hate with their official account.
+There are already initial attempts to detect hate speech with the help of algorithms.
+
+This student research project also deals with the detection of hate speech.
+Using tweets from the [@Wiegand2019]dataset, which are already labelled as offensive, models are calculated that can filter tweets containing hate speech.
+
+# Loading packages
+
+```{r packages}
+#| warning: false
+library(cvms)
+library(discrim) 
+library(doParallel)
+library(glmnet)
+library(kknn)
+library(pradadata)
+library(skimr)
+library(stopwords)
+library(syuzhet)
+library(textdata)
+library(textrecipes)
+library(tictoc)
+library(tidymodels)
+library(tidyverse)
+library(tinytex)
+library(tm)
+library(tokenizers)
+library(remoji)
+library(wordcloud)
+```
+
+# Reading Data
+
+```{r data}
+#| warning: false
+d_train0 <- read_tsv("./germeval2018.training.txt",
+           col_names = FALSE)
+
+d_test0 <- read_tsv("./germeval2018.test.txt",
+           col_names = FALSE)
+```
+
+# Naming Columns
+
+```{r name}
+#| warning: false
+names(d_train0) <- c("text", "label", "type")
+
+names(d_test0) <- c("text", "label", "type") 
+```
+
+# Removing *type*
+
+```{r type}
+#| warning: false
+d_train0$type <- NULL
+
+d_test0$type <- NULL
+```
+
+# Missing values
+
+```{r NAs}
+#| eval: true
+#| echo: false
+#| warning: false
+skim(d_train0)
+
+skim(d_test0)
+```
+
+The dataset has no NAs.
+
+# Adding an id
+
+```{r id}
+#| warning: false
+d_train <-
+  rowid_to_column(d_train0, "id")
+
+d_test <-
+  rowid_to_column(d_test0, "id")
+```
+
+# Sentiment analysis
+
+For the sentiment analysis of the tweets, the NRC word-emotion association lexicon by [@Mohammad2013] is used.
+The lexicon can be used with the help of the get_nrc_sentiment command of the [@syuzhet] package.\
+
+For the recipes, however, the csv file is used, which is why it is already read in in this step.
+
+```{r lexicon}
+#| warning: false
+#| #| echo: false
+nrc_lexicon <- read_tsv("./German-NRC-EmoLex.txt") %>% 
+  rename(word = "German Word")
+```
+
+You can get the complete folder with the data set and the paper by this code:
+
+```{r nrc}
+#lexicon_nrc(
+#  dir = NULL,
+#  delete = FALSE,
+#  return_path = FALSE,
+#  clean = FALSE,
+#  manual_download = FALSE)
+```
+
+```{r senti raw}
+#| eval: true
+#| echo: false
+#| warning: false
+tweets <- iconv(d_train$text)
+
+train_senti <- get_nrc_sentiment(tweets)
+
+barplot(colSums(train_senti),
+        las = 2,
+        col = rainbow(10),
+        ylab = 'Count',
+        main = 'Sentiment Scores Tweets')
+```
+
+Fear, sadness and negativity are the most common emotions.
+
+# Wordcloud
+
+```{r wordcloud fun}
+#| eval: true
+#| echo: false
+#| warning: false
+removeURL <- function(x) gsub('http[[:alnum:]]*', '', x)
+removeLBR <- function(x) gsub('(lbr)+', '', x)
+```
+
+```{r wordcloud}
+#| eval: true
+#| echo: false
+#| warning: false
+d_off <- d_train %>% 
+  filter(label == "OFFENSE")
+
+corpus1 <- iconv(d_off$text)
+corpus1 <- Corpus(VectorSource(corpus1))
+corpus1 <- tm_map(corpus1, tolower)
+corpus1 <- tm_map(corpus1, removePunctuation)
+corpus1 <- tm_map(corpus1, removeNumbers)
+cleanset1 <- tm_map(corpus1, removeWords, stopwords('german'))
+cleanset1 <- tm_map(cleanset1, content_transformer(removeURL))
+cleanset1 <- tm_map(cleanset1, content_transformer(removeLBR))
+cleanset1 <- tm_map(cleanset1, stemDocument)
+cleanset1 <- tm_map(cleanset1, stripWhitespace)
+
+d_wordcloud1 <- TermDocumentMatrix(cleanset1)
+d_wordcloud1 <- as.matrix(d_wordcloud1)
+
+wordcloud1 <- sort(rowSums(d_wordcloud1), decreasing = TRUE)
+
+set.seed(222)
+wordcloud(words = names(wordcloud1),
+          freq = wordcloud1,
+          max.words = 50,
+          random.order = F,
+          min.freq = 5,
+          colors = brewer.pal(8, 'Paired'),
+          scale = c(5, 0.3),
+          rot.per = 0.7)
+```
+
+# Classification model - supervised learning
+
+In this work, we do not split the train data because the file already consists of many observations (tweets) and we already own the test data.
+I also decided to leave this step out because the computation time is shorter.
+However, we could use the following code to divide the data set for a possible better prediction:
+
+```{r}
+# d_split <- initial_split(d_train, prop = 0.75, strata = label)
+
+# d_s_train <- training(d_split)
+
+# d_s_test <- testing(d_split)
+```
+
+For a manageable amount of data and reduction of computing time, only the most frequent 100 tokens are kept in the recipes.
+
+```{r max}
+#| warning: false
+max_words <- 1e2
+```
+
+## Recipe 1 (minimum)
+
+```{r rec1}
+#| warning: false
+rec1 <-
+  recipe(label ~ ., data = select(d_train, text, label, id)) %>%
+  update_role(id, new_role = "id") %>% 
+  step_text_normalization(text) %>% 
+  step_mutate(copy = text) %>% 
+  step_textfeature(copy) %>% 
+  step_tokenize(text) %>%
+  step_tokenfilter(text, max_tokens = max_words) %>%
+  step_tfidf(text) %>% 
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+If you want to see how the recipes changes the data and do not want the recipe to be a black box, you can delete the hashtags and prep and bake every recipe.
+
+```{r rec1 bak}
+#rec1_prep <- prep(rec1, verbose = TRUE)
+
+#rec1_bak <- rec1_prep %>%
+#  bake(new_data = NULL)
+
+#slice_head(rec1_bak, n = 5)
+```
+
+## Recipe 2 (stopwords)
+
+The tweets contain some stopwords.
+Stopwords are frequently used words, such as a or the, with no deeper meaning.
+Because we want to filter out offensive speech, we don't want stopwords in our data.
+Therefore, we delete them in the following recipes.
+
+```{r rec2}
+#| warning: false
+rec2 <-
+  recipe(label ~ ., data = select(d_train, text, label, id)) %>%
+  update_role(id, new_role = "id") %>% 
+  step_text_normalization(text) %>% 
+  step_mutate(copy = text)  %>% 
+  step_textfeature(copy)  %>% 
+  step_tokenize(text) %>%
+  step_stopwords(text, language = "de", stopword_source = "stopwords-iso") %>%
+  step_tokenfilter(text, max_tokens = max_words) %>%  
+  step_tfidf(text)  %>% 
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+```{r rec2 bak}
+#| eval: true
+#| echo: false
+#| warning: false
+#rec2_prep <- prep(rec2, verbose = TRUE)
+
+#rec2_bak <- rec2_prep %>%
+#  bake(new_data = NULL)
+
+#slice_head(rec2_bak, n = 5)
+```
+
+## Recipe 3 (stemmatization)
+
+Tweets contain different versions of a base word.
+With step_stem we can do stemming, which means that an algorithm identifies the base word from each individual word and merges them into one variable.
+
+```{r rec3}
+#| warning: false
+rec3 <-
+  recipe(label ~ ., data = select(d_train, text, label, id)) %>%
+  update_role(id, new_role = "id") %>% 
+  step_text_normalization(text) %>% 
+  step_mutate(copy = text) %>% 
+  step_textfeature(copy) %>% 
+  step_tokenize(text) %>%
+  step_stopwords(text, language = "de", stopword_source = "stopwords-iso") %>%
+  step_stem(text) %>%
+  step_tokenfilter(text, max_tokens = max_words) %>% 
+  step_tfidf(text) 
+```
+
+```{r rec3 bak}
+#| eval: true
+#| echo: false
+#| warning: false
+rec3_prep <- prep(rec3, verbose = TRUE)
+
+rec3_bak <- rec3_prep %>%
+  bake(new_data = NULL)
+
+rec3_bak %>%
+  select(49:50) %>%
+slice_head(n = 5)
+```
+
+As you can see, the stemming algorithm does not work perfectly.
+For example, *deutsch* and *deutschen* are still separate predictors even though they belong to the same root.
+Here, we could create our own stemming algorithm, but this would go beyond the scope of this paper, so we will continue with SnowballC.
+
+## Recipe 4 (sentiment / wild emojis / profane words)
+
+In the following recipes we use lists of wild emojis and profane words from [@pradadata] and the NRC word-emotion association lexicon to get more information from the data.
+To use them we need to define some functions.
+
+```{r senti}
+#| warning: false
+count_profane <- function(text, profane_list = schimpfwoerter$word) {
+  sum((tokenizers::tokenize_tweets(text, simplify = TRUE) %>% purrr::as_vector()) %in% profane_list)
+}
+```
+
+```{r profane}
+#| warning: false
+count_senti <- function(text,senti_list = nrc_lexicon$word) {
+  sum((tokenizers::tokenize_tweets(text, simplify = TRUE) %>% purrr::as_vector()) %in% senti_list)
+}
+```
+
+```{r wild emojis}
+count_wild_emojis <- function(text, wild_emojis_list = wild_emojis$emoji) {
+  sum((tokenizers::tokenize_tweets(text, simplify = TRUE) %>% purrr::as_vector()) %in% wild_emojis_list)
+}
+```
+
+*ATTENTION* When trying to define these functions on different computers, it turned out that tokenize_tweets no longer exists in the update of the package [@tokenizers].
+Accordingly, for version 0.3.0, for example, the command must be exchanged.
+
+```{r rec4}
+#| warning: false
+rec4 <-
+  recipe(label ~ ., data = select(d_train, text, label, id)) %>%
+  update_role(id, new_role = "id") %>% 
+  step_text_normalization(text) %>%
+  step_mutate(profane_n = purrr::map_int(text, ~ count_profane(.x, schimpfwoerter$word))) %>%
+  step_mutate(senti_n = purrr::map_int(text, ~ count_senti(.x, nrc_lexicon$word))) %>%
+  step_mutate(wild_emoji_n = purrr::map_int(text, ~ count_wild_emojis(.x, wild_emojis$emoji))) %>%
+  step_mutate(copy = text) %>%
+  step_textfeature(copy) %>%
+  step_tokenize(text) %>%
+  step_stopwords(text, language = "de", stopword_source = "stopwords-iso") %>%
+  step_stem(text) %>%
+  step_tokenfilter(text, max_tokens = max_words) %>% 
+  step_tfidf(text) %>% 
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+```{r rec4 bak}
+#| eval: true
+#| echo: false
+#| warning: false
+rec4_prep <- prep(rec4, verbose = TRUE)
+ 
+rec4_bak <- rec4_prep %>%
+  bake(new_data = NULL)
+
+slice_head(rec4_bak, n = 5)
+```
+
+As you can see, the fourth recipe works.
+However, Fit & Tun displayed the error message "failed with".
+Lets have a closer look and make a workflow manually.
+
+```{r rec4 try}
+#| warning: false
+#set.seed(42)
+#val_set <- validation_split(d_train, 
+#                            strata = label,
+#                            prop = 0.80)
+
+#rec4_wf <- 
+#  workflow() %>%
+#  add_model(lr_mod) %>%
+#  add_recipe(rec4)
+
+#set.seed(345)
+#rec4_res <- 
+#  rec4_wf %>% 
+#  tune_grid(val_set,
+#            grid = 25,
+#            control = control_grid(save_pred = TRUE),
+#            metrics = metric_set(roc_auc))
+
+#rec4_res %>% 
+#  show_best(metric = "roc_auc")
+
+#d_train_num <- d_train %>% 
+#  mutate(label = case_when(label == "OFFENSE"  ~ 1
+#                                     ,TRUE ~ 0
+#                                     ))
+
+```
+
+If you execute this code, the following error message appears:
+
+"Error in `dplyr::mutate()`: ! Problem while computing `profane_n = purrr::map_int(text,   count_profane, profane_list = schimpfwoerter$word)`. Caused by error in `as_mapper()`: ! Objekt 'count_profane' nicht gefunden".
+
+The recipe works and can build the new predictors so I can not identify the problem.
+Also the functions are formed without problems and appears in the environment.
+I also tried if it works if the *label* is numeric (*d_train_num*), but that does not work either.
+
+Since the recipe and the workflow set is working with the other recipes, we try to solve the problem by forming a new recipe with *rec4_bak.*
+
+```{r rec4 new}
+#| warning: false
+rec4_new <-
+  recipe(label ~ ., data = rec4_bak)
+```
+
+```{r rec4 new bak}
+#| eval: true
+#| echo: false
+#| warning: false
+#| output: false
+rec4_prep_new <- prep(rec4_new, verbose = TRUE)
+ 
+rec4_bak_new <- rec4_prep_new %>%
+  bake(new_data = NULL)
+
+slice_head(rec4_bak_new, n = 5)
+```
+
+## Models
+
+```{r models}
+#| warning: false
+doParallel::registerDoParallel()
+
+nb_mod <- naive_Bayes() %>% 
+  set_mode("classification") %>% 
+  set_engine("naivebayes")
+
+forest_mod <- rand_forest(mtry = tune(), min_n = tune(), trees = 2000) %>%
+  set_engine("ranger", num.threads = 12) %>% 
+    set_mode("classification")
+
+boost_mod <- boost_tree(mtry = tune(), min_n = tune(), trees = tune(),
+                      learn_rate = tune(), tree_depth = tune(), loss_reduction = tune()) %>% 
+  set_engine("xgboost", nthreads = 12) %>% 
+  set_mode("classification")
+
+nn_mod <- mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>% 
+   set_engine("nnet", MaxNWts = 10000) %>% 
+   set_mode("classification")
+
+dt_mod <- decision_tree(cost_complexity = tune(), tree_depth = tune() ) %>% 
+  set_engine("rpart") %>% 
+  set_mode("classification")
+
+lr_mod <- logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("classification")
+
+knn_mod <- nearest_neighbor(neighbors = tune()) %>% 
+  set_engine("kknn") %>% 
+  set_mode("classification")
+
+null_mod <- null_model() %>% 
+  set_engine("parsnip") %>% 
+  set_mode("classification")
+```
+
+## Workflow 1-3
+
+```{r wf set}
+#| warning: false
+preproc <- list(rec1  = rec1, rec2 = rec2, rec3 = rec3)
+models <- list(nb = nb_mod,
+               forest = forest_mod, 
+               boost = boost_mod, 
+               nn = nn_mod,
+               dt = dt_mod,
+               lr = lr_mod,
+               knn = knn_mod,
+               null = null_mod
+                ) 
+ 
+wf <- workflow_set(preproc, models)
+```
+
+## Fit & Tune 1-3
+
+```{r folds}
+#| warning: false
+set.seed(42)
+folds <- vfold_cv(d_train, v = 10)
+```
+
+```{r fit tune}
+#| warning: false
+tic()
+model_set <- wf %>% 
+  workflow_map(resamples = folds, grid = 10, seed = 42, verbose = TRUE)
+toc()
+```
+
+If you run the set with the fourth recipe, an error occurs.
+It seems like the recipe has a problem with the crossvalidation due to new variables that does not exist in *d_train.* Lets try to fix that by trying a crossvalidation made with the *rec4_bak* data.
+
+## Workflow 4
+
+```{r wf set4}
+#| warning: false
+preproc4 <- list(rec1  = rec4_new)
+models4 <- list(nb4 = nb_mod,
+               forest4 = forest_mod, 
+               boost4 = boost_mod, 
+               nn4 = nn_mod,
+               dt4 = dt_mod,
+               lr4= lr_mod,
+               knn4 = knn_mod,
+               null4 = null_mod
+                ) 
+
+wf4 <- workflow_set(preproc4, models4)
+```
+
+## Fit & Tune 4
+
+```{r folds rec4}
+set.seed(42)
+folds4 <- vfold_cv(rec4_bak, v = 10)
+```
+
+```{r fit tune 4}
+#| warning: false
+tic()
+model_set4 <- wf4 %>% 
+  workflow_map(resamples = folds4, grid = 10, seed = 42, verbose = TRUE)
+toc()
+```
+
+Looks good, but I can not see the problem, because the other recipes also create new variables that are not in *d_train*.
+But for now we can work with this solution.
+So that there is no confusion, we will create the same models again with the ending 4.
+Since we now have two workflows, we have to evaluate the results of these two ourselves and find the workflow that performs best.
+
+## Finalize 1-3
+
+```{r performance}
+#| eval: true
+#| echo: false
+#| warning: false
+tune::autoplot(model_set)
+```
+
+```{r best}
+#| eval: true
+#| echo: false
+#| warning: false
+rank_results(model_set, select_best = TRUE, rank_metric = "roc_auc")
+```
+
+## Finalize 4
+
+```{r performance4}
+#| eval: true
+#| echo: false
+#| warning: false
+tune::autoplot(model_set4)
+```
+
+```{r best4}
+#| eval: true
+#| echo: false
+#| warning: false
+rank_results(model_set4, select_best = TRUE, rank_metric = "roc_auc")
+```
+
+## Best model
+
+Since it is not certain why the fourth recipe can not be processed in the same way as the others and the metrics of the third and fourth recipes are similar, we continue to work with the third recipe.
+
+These are the values of the parameters of *rec3_boost*:
+
+```{r best mod}
+#| eval: true
+#| echo: false
+#| warning: false
+best_model_para <- extract_workflow_set_result(model_set, "rec3_boost") %>% 
+  select_best()
+
+best_model_para
+```
+
+```{r best wf}
+#| warning: false
+best_wf <- wf %>% 
+  extract_workflow("rec3_boost") 
+```
+
+```{r final wf}
+#| warning: false
+final_wf <- best_wf %>%
+  finalize_workflow(best_model_para)
+```
+
+## Final Fit
+
+```{r final fit}
+#| warning: false
+#| echo: false
+#| output: false
+final_fit <- 
+  fit(final_wf, d_train) 
+```
+
+# Predictions
+
+```{r pred}
+#| warning: false
+pred <- predict(final_fit, new_data = d_test) 
+```
+
+```{r matrix}
+#| eval: true
+#| echo: false
+#| warning: false
+pred_id <-
+  rowid_to_column(pred, "id")
+
+d_test$text <- NULL
+
+tab <- table(pred_id$.pred_class, d_test$label)
+
+conf_mat <- confusion_matrix(target = d_test$label,
+                             predictions = pred$.pred_class)
+
+plot_confusion_matrix(conf_mat)
+```
+
+Obviously, with this data and workflow, offensive language can not be detected so easily.
+To improve the workflow, we could train the model with more/new/different data and use regex to delete more words that are not offensive but are treated as such by the algorithm because the tweet as a whole is labelled as *OFFENSIVE*
+
+# Saving predictions
+
+```{r}
+#| warning: false
+prediction <- 
+  pred_id %>% 
+  select(id, .pred_class)
+
+prediction %>%
+  write_csv("hate_speech_schlicht_prognose.csv")
+```
+
+PS: If you have found the problem and the solution of the whole rec4 thing please let me know :)
